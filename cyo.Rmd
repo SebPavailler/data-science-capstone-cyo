@@ -1,0 +1,471 @@
+---
+title: "HarvardX PH125.9x - Data Science: Capstone"
+author: "Sebastien Pavailler"
+date: "14/11/2022"
+output: pdf_document
+---
+
+```{r include=FALSE}
+
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(comment=NULL)
+knitr::opts_chunk$set(warning=FALSE)
+```
+
+
+
+```{r}
+# load relevant packages
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(rjson)) install.packages("rjson", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(broom)) install.packages("broom", repos = "http://cran.us.r-project.org")
+```
+
+```{r}
+# opens data file - JSON format
+tmp_dat <- fromJSON(file='C:/Users/pavaills/OneDrive - Amer Sports/Documents/R-projects/ds-capstone-cyo/Activities.json') # change to GitHub
+
+# see data structure
+summary(tmp_dat)
+```
+List of 1, however all my activities are in here - data should be nested
+
+
+```{r}
+summary(tmp_dat[[1]])
+```
+Here we are a list of 1000 elements that correspond to my activities
+Unnest the data to get all my activities as this list of 1000
+
+```{r}
+activities_list <- tmp_dat[[1]]$summarizedActivitiesExport
+rm(tmp_dat)
+
+head(summary(activities_list))
+```
+
+Each activity is a list itself, that looks to be of variable length.
+
+
+```{r}
+head(activities_list[[1]])
+
+```
+
+The features of my activities are here. We noticed each activity is a list of variable length, see that as a histogram.
+
+```{r}
+list_lengths <- sapply(activities_list, function(x){length(x)})
+hist(list_lengths)
+```
+Means not every activity has the same number of features. It may not be a big deal as I am gonna use only a specific set of features (need to justify this in the intro).
+
+
+I would like to have the features in a data frame format to use it more easily.
+Write a function to do that.
+
+
+```{r}
+activities_df <- bind_rows(sapply(activities_list, function(x){
+  as_tibble_row(unlist(x))
+}))
+
+
+head(activities_df, 10)
+
+```
+
+After examining the data frame and given the data I want to work with (sport, distance, elevation, start time), I can select the relevant variables for my project and transform them a bit to have the relevant class, name, format. Also apply some data quality filters (remove duration lower than 10 min, elevation gain higher than 5000)
+
+```{r}
+activities <- activities_df %>% 
+  select(activityId, activityType, startTimeLocal, duration, distance, elevationGain, elevationLoss) %>% 
+  mutate(activity_id = as.numeric(activityId),
+         activity_type = ifelse(activityType=="swimming", "lap_swimming", 
+                                          ifelse(activityType=="cross_country_skiing_ws", "cross_country_skiing", activityType)),
+         start_time = as.numeric(startTimeLocal)/1000,
+         duration = as.numeric(duration)/1000,
+         distance = as.numeric(distance)/100,
+         elevation_gain = as.numeric(elevationGain)/100,
+         elevation_loss = as.numeric(elevationLoss)/100) %>% 
+  select(activity_id, activity_type, start_time, distance, elevation_gain, elevation_loss, duration) %>% 
+  filter(activity_type %in% c("cycling", "running", "open_water_swimming", "trail_running", "cross_country_skiing", "lap_swimming"),
+         duration > 600,
+         elevation_gain <5000 | is.na(elevation_gain)) %>% 
+  mutate(activity_type=as.factor(activity_type))
+
+
+```
+
+
+
+
+
+We are going to split the dataset into a cyo and a validation set. Validation will be 10% of the global dataset
+
+```{r}
+set.seed(91, sample.kind="Rounding")
+valid_index <- createDataPartition(y = activities$duration, times = 1, p = 0.1, list = FALSE)
+cyo <- activities[-valid_index,]
+validation <- activities[valid_index,]
+rm(valid_index)
+```
+
+To keep the validation set for the final test of the algorithms, I further split the cyo set into train and test set - with test set 20% of cyo.
+
+```{r}
+set.seed(2020, sample.kind="Rounding")
+test_index <- createDataPartition(y = cyo$duration, times = 1, p = 0.2, list = FALSE)
+train_set <- cyo[-test_index,]
+test_set <- cyo[test_index,]
+rm(test_index)
+```
+
+
+
+Define the RMSE function
+
+```{r}
+RMSE <- function(true_values, predicted_values){
+  sqrt(mean((true_values - predicted_values)^2))
+}
+```
+
+
+Predicting just the mean.
+
+```{r}
+mu <- mean(train_set$duration)
+
+RMSE(test_set$duration, mu)
+
+```
+We do an error close to 1 hour which is huge but expected.
+
+
+
+Now let's explore data and start building our model
+
+```{r}
+
+# effect of activity type on duration
+train_set %>% 
+  ggplot(aes(activity_type, duration)) + geom_boxplot()
+
+
+```
+
+Looks to have an effect of activity type on duration, first model to estimate duration based on an activity bias.
+
+```{r}
+b_act <- train_set %>% 
+  group_by(activity_type) %>% 
+  summarize(b_act = mean(duration - mu))
+
+pred_1 <- test_set %>% 
+  left_join(b_act, by='activity_type') %>% 
+  mutate(pred = mu + b_act) %>% 
+  pull(pred)
+
+RMSE(test_set$duration, pred_1)
+
+```
+The error is still quite high, more than 45 min.
+
+
+Effect of distance
+
+
+```{r}
+# Effect of distance on duration
+ train_set %>% 
+  ggplot(aes(distance/1000, duration/60)) + geom_point()
+
+```
+
+It looks to be a distance effect on duration - let's build a simple linear regression model
+
+
+```{r}
+
+fit_dist <- train_set %>% 
+  lm(duration ~ distance, data=.)
+
+pred_2 <- predict(fit_dist, test_set)
+
+RMSE(test_set$duration, pred_2)
+
+```
+We improve the model but the error is still more than 20 min
+
+
+Interaction distance and activity type
+
+```{r}
+# Effect of distance on duration
+ train_set %>% 
+  ggplot(aes(distance, duration, color=activity_type)) + geom_point() + geom_smooth(method = 'lm') + theme_bw()
+
+```
+
+Let's build different linear regression models depending on the activity type
+
+```{r}
+# extract a vector of activity types
+activity_types <- train_set %>% 
+  select(activity_type) %>% 
+  mutate(activity_type=as.character(activity_type)) %>% 
+  distinct(.) %>% 
+  pull(activity_type) 
+
+# fit linear models for each activity type
+fit_dist_act <- sapply(activity_types, function(x){
+  fit <- train_set %>% 
+    filter(activity_type==x) %>% 
+    lm(duration ~ distance, data=.)
+  c(fit$coefficients[1], fit$coefficients[2])
+})
+
+# store the coefficients in a tibble
+b_dist_act <- tibble(activity_type = colnames(fit_dist_act),
+                     intercept=fit_dist_act[1,],
+                     beta_dist=fit_dist_act[2,])
+
+# make predictions
+pred_3 <- test_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(pred = intercept+beta_dist*distance) %>% 
+  pull(pred)
+
+
+RMSE(test_set$duration, pred_3)
+
+
+```
+
+We improve again, now error less than 15 min
+
+
+Visual check of residuals vs. distance
+
+```{r}
+train_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(residuals = duration - (intercept+beta_dist*distance)) %>%
+  ggplot(aes(distance, residuals)) + geom_point() + geom_smooth()
+```
+
+Looks to have large negative residuals for the longest distances -> add a penalty 
+
+
+
+
+Elevation gain effect
+
+Elevation gain is the cumulative elevation on the activity.
+Obviously, the higher the distance the higher the elevation gain.
+Confirmed by the grah below
+
+```{r}
+train_set %>% 
+  ggplot(aes(elevation_gain, distance)) + geom_point() 
+```
+
+Makes sense to normalize the elevation gain by distance to get a variable corresponding to an average slope on the activity.
+Redo the plot with elevation normalized.
+
+
+```{r}
+train_set %>% 
+  mutate(elevation_norm = elevation_gain/distance) %>% 
+  ggplot(aes(elevation_norm, distance)) + geom_point() 
+```
+Large variety of distances for similar normalized elevations. 
+Some really high normalized elevation, quite steep slope.
+Plot the residuals of the previous model vs. normalized elevation.
+
+
+```{r}
+train_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(residuals = duration - (intercept+beta_dist*distance)) %>%
+  mutate(elevation_norm = elevation_gain/distance) %>% 
+  ggplot(aes(elevation_norm, residuals)) + geom_point() 
+```
+
+Looks to have a threshold value above which residuals are more frequently positive.
+
+
+```{r}
+train_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(residuals = duration - (intercept+beta_dist*distance)) %>%
+  mutate(elevation_norm = elevation_gain/distance) %>% 
+  ggplot(aes(elevation_norm, residuals)) + geom_point() + geom_vline(xintercept =.045, color='red')
+```
+This threshold is a tuning parameter, we can use cross validation to pick it up.
+
+```{r}
+thr <-  seq(0.02,0.07,0.005)
+
+rmses <- sapply(thr, function(t){
+b_elev <- train_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(elevation_norm = elevation_gain/distance) %>% 
+  filter(elevation_norm > t) %>% 
+  summarize(b_elev = mean(duration - (intercept+beta_dist*distance))) %>% 
+  pull(b_elev)
+
+# make predictions
+pred_elev <- test_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(elevation_norm = elevation_gain/distance,
+         pred = ifelse(elevation_norm < t | is.na(elevation_norm),
+                       intercept + beta_dist*distance,
+                       intercept + beta_dist*distance + b_elev)) %>% 
+  pull(pred)
+
+return(RMSE(test_set$duration, pred_elev))
+})
+
+qplot(thr, rmses)
+
+
+
+  
+```
+
+
+```{r}
+
+thr_elev <- thr[which.min(rmses)]
+pred_4 <- min(rmses)
+pred_4
+```
+
+Further improvement to around 13 min
+
+
+
+
+```{r}
+train_set %>% 
+  left_join(b_dist_act, by='activity_type') %>% 
+  mutate(residuals = duration - (intercept+beta_dist*distance),
+         start_month = month(round_date(as_datetime(start_time),unit="month"))) %>%
+  ggplot(aes(start_month, residuals, group=start_month)) + geom_boxplot() + facet_wrap(~activity_type)
+
+
+
+  
+```
+
+
+
+
+FINAL VALIDATION
+
+
+
+```{r}
+
+# Simple mean
+ mu_f <- mean(cyo$duration)
+
+RMSE(validation$duration, mu_f)
+
+
+
+```
+
+```{r}
+
+# activity effect
+
+b_act_f <- cyo %>% 
+  group_by(activity_type) %>% 
+  summarize(b_act_f = mean(duration - mu))
+
+pred_1_f <- validation %>% 
+  left_join(b_act_f, by='activity_type') %>% 
+  mutate(pred = mu + b_act_f) %>% 
+  pull(pred)
+
+RMSE(validation$duration, pred_1_f)
+```
+
+
+```{r}
+
+# distance linear regression
+
+fit_dist_f <- cyo %>% 
+  lm(duration ~ distance, data=.)
+
+pred_2_f <- predict(fit_dist_f, validation)
+
+RMSE(validation$duration, pred_2_f)
+
+```
+
+```{r}
+
+# fit linear models for each activity type
+fit_dist_act_f <- sapply(activity_types, function(x){
+  fit <- cyo %>% 
+    filter(activity_type==x) %>% 
+    lm(duration ~ distance, data=.)
+  c(fit$coefficients[1], fit$coefficients[2])
+})
+
+# store the coefficients in a tibble
+b_dist_act_f <- tibble(activity_type = colnames(fit_dist_act_f),
+                     intercept=fit_dist_act_f[1,],
+                     beta_dist=fit_dist_act_f[2,])
+
+# make predictions
+pred_3_f <- validation %>% 
+  left_join(b_dist_act_f, by='activity_type') %>% 
+  mutate(pred = intercept+beta_dist*distance) %>% 
+  pull(pred)
+
+
+RMSE(validation$duration, pred_3_f)
+```
+
+
+```{r}
+b_elev_f <- cyo %>% 
+  left_join(b_dist_act_f, by='activity_type') %>% 
+  mutate(elevation_norm = elevation_gain/distance) %>% 
+  filter(elevation_norm > thr_elev) %>% 
+  summarize(b_elev_f = mean(duration - (intercept+beta_dist*distance))) %>% 
+  pull(b_elev_f)
+
+# make predictions
+pred_4_f <- validation %>% 
+  left_join(b_dist_act_f, by='activity_type') %>% 
+  mutate(elevation_norm = elevation_gain/distance,
+         pred = ifelse(elevation_norm < thr_elev | is.na(elevation_norm),
+                       intercept + beta_dist*distance,
+                       intercept + beta_dist*distance + b_elev_f)) %>% 
+  pull(pred)
+
+RMSE(validation$duration, pred_4_f)
+```
+
+```{r}
+RMSE(validation$duration, pred_4_f)/mu_f*100
+```
+
+Close to 10 min, around 12% of mean duration for my activities.
+Sounds quite acceptable for a rough estimation of an activity duration.
+Perspectives
+Quite few data (stratification by activity - only 17 activities for lap swimming)
+Can be enriched from the data of other users + collaborative filtering to make predictions based on users similar to me.
+
+Think that could be an interesting tool for activity networks (Strava...) to give a quite precise indication of the activity time when planning.
+
