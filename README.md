@@ -12,6 +12,7 @@ Key points:
 
 
 Files:
+- Activities.json - the data file used for this project
 - notebook.rmd - R notebook for the project
 - script.R - fully commented R script to execute the project
 - report.pdf - knitted report from R knitr
